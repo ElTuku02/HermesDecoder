@@ -1,11 +1,40 @@
+/*
+ * HermesDecoder - PGA460 config frame decoder (C) + CSV export
+ *
+ * Frame format (your protocol):
+ *   [0..1]  : prefix/mode (e.g., 0x5E02) -> ignored for register mapping
+ *   [2..56] : 55 bytes -> REG1..REG55 in fixed order
+ *
+ * Default: prints "raw decode" (registers + bitfields)
+ * --csv   : generates threshold profile CSVs (P1 and P2)
+ *
+ * CSV columns:
+ *   stage,delta_us,t_us,dist_cm,value_pct,value_raw
+ *
+ * Extra raw decode feature:
+ *   - After Px_THR_10 (REG34 for P1, REG50 for P2) it prints decoded L1..L8
+ *     (5-bit packed values) both raw and percentage.
+ *
+ * Build:
+ *   gcc -O2 -Wall -Wextra hermes_decoder.c -o HermesDecoder
+ *
+ * Run:
+ *   echo "<HEX>" | ./HermesDecoder
+ *   echo "<HEX>" | ./HermesDecoder --csv
+ *   echo "<HEX>" | ./HermesDecoder --csv prefix
+ */
+
 #include <stdio.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <string.h>
 
+/* ------------------ bit helpers ------------------ */
 #define GET_BITS(byte, lsb, width) (((byte) >> (lsb)) & ((1u << (width)) - 1u))
 #define HI_NIBBLE(b) (((b) >> 4) & 0x0F)
 #define LO_NIBBLE(b) ((b) & 0x0F)
 
+/* ------------------ hex parsing ------------------ */
 static int hexval(char c){
     if ('0'<=c && c<='9') return c-'0';
     if ('a'<=c && c<='f') return 10 + (c-'a');
@@ -31,7 +60,135 @@ static int parse_hex_bytes(const char *s, uint8_t *out, int max_out){
     return n;
 }
 
-static void decode_reg(int idx /*1..55*/, uint8_t b){
+/* ------------------ time mapping (4b -> us) ------------------ */
+static const int TIME_US[16] = {
+    100, 200, 300, 400,
+    600, 800, 1000, 1200,
+    1400, 2000, 2400, 3200,
+    4000, 5200, 6400, 8000
+};
+
+static int nibble_to_us(uint8_t n){
+    return TIME_US[n & 0x0F];
+}
+
+/* ------------------ distance conversion ------------------ */
+/*
+ * Distance (cm) from time-of-flight (us):
+ *   d = v * t / 2
+ * Default v = 343 m/s
+ * d_cm = t_us * (34300 cm/s) * 1e-6 / 2 = t_us * 0.01715
+ */
+#ifndef SPEED_OF_SOUND_M_S
+#define SPEED_OF_SOUND_M_S 343.0
+#endif
+
+static double tof_us_to_cm(int t_us){
+    return (double)t_us * ((SPEED_OF_SOUND_M_S * 100.0) / 1e6) / 2.0;
+}
+
+/* ------------------ Threshold profile extraction (Excel-aligned) ------------------
+ * Px_THR_0..5  : 12 nibbles of time (T1..T12) -> mapped using TIME_US[]
+ * Px_THR_6..10 : L1..L8 packed as 8 values of 5 bits (total 40 bits = 5 bytes)
+ * Px_THR_11..14: L9..L12 stored as full bytes
+ * Px_THR_15    : reserved/offsets (not used in profile curve here)
+ *
+ * Indexing:
+ *   reg[0]  = REG1
+ *   reg[23] = REG24 (P1_THR_0)
+ *   reg[39] = REG40 (P2_THR_0)
+ */
+
+static void extract_T12_us(const uint8_t reg[55], int is_p2, int t_us[12]){
+    int base = is_p2 ? 39 : 23; // P2: REG40..45, P1: REG24..29
+    for (int i = 0; i < 6; i++){
+        uint8_t b = reg[base + i];
+        t_us[i*2 + 0] = nibble_to_us(HI_NIBBLE(b)); // T(1+2i)
+        t_us[i*2 + 1] = nibble_to_us(LO_NIBBLE(b)); // T(2+2i)
+    }
+}
+
+static void extract_L1_L8_5bit(const uint8_t reg[55], int is_p2, int L[8]){
+    int base = is_p2 ? 45 : 29; // P2: REG46..50, P1: REG30..34
+
+    // Concatenate 5 bytes into a 40-bit MSB-first bitstream
+    uint64_t bits = 0;
+    for (int i = 0; i < 5; i++){
+        bits = (bits << 8) | (uint64_t)reg[base + i];
+    }
+
+    // Extract 8 groups of 5 bits from MSB to LSB: [L1][L2]...[L8]
+    for (int i = 0; i < 8; i++){
+        int shift = (40 - 5) - (i * 5);
+        L[i] = (int)((bits >> shift) & 0x1F); // 0..31
+    }
+}
+
+static void extract_L9_L12_8bit(const uint8_t reg[55], int is_p2, int L[4]){
+    int base = is_p2 ? 50 : 34; // P2: REG51..54, P1: REG35..38
+    for (int i = 0; i < 4; i++){
+        L[i] = reg[base + i]; // 0..255
+    }
+}
+
+static double value_to_pct(int stage /*1..12*/, int raw){
+    if (stage <= 8) return (raw / 31.0) * 100.0;   // 5-bit
+    return (raw / 255.0) * 100.0;                  // 8-bit
+}
+
+/* Prints decoded L1..L8 (raw and %) for P1 or P2 */
+static void print_L1_L8_decoded(const uint8_t reg[55], int is_p2){
+    int L[8];
+    extract_L1_L8_5bit(reg, is_p2, L);
+
+    printf("    Decoded %s L1..L8 (5-bit):\n", is_p2 ? "P2" : "P1");
+    for (int i = 0; i < 8; i++){
+        int stage = i + 1; // 1..8
+        double pct = value_to_pct(stage, L[i]);
+        printf("      L%d = %2d  (%.2f%%)\n", i + 1, L[i], pct);
+    }
+}
+
+static int write_profile_csv(const char *path, const uint8_t reg[55], int is_p2){
+    int delta_us[12];
+    int L5[8], L8[4];
+    int value_raw[12];
+
+    extract_T12_us(reg, is_p2, delta_us);
+    extract_L1_L8_5bit(reg, is_p2, L5);
+    extract_L9_L12_8bit(reg, is_p2, L8);
+
+    for (int i = 0; i < 8; i++) value_raw[i] = L5[i];
+    for (int i = 0; i < 4; i++) value_raw[8 + i] = L8[i];
+
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+
+    fprintf(f, "stage,delta_us,t_us,dist_cm,value_pct,value_raw\n");
+
+    int acc_us = 0;
+    for (int i = 0; i < 12; i++){
+        int stage = i + 1;
+        acc_us += delta_us[i];
+
+        double dist_cm = tof_us_to_cm(acc_us);
+        double pct = value_to_pct(stage, value_raw[i]);
+
+        fprintf(f, "%d,%d,%d,%.4f,%.2f,%d\n",
+                stage,
+                delta_us[i],
+                acc_us,
+                dist_cm,
+                pct,
+                value_raw[i]);
+    }
+
+    fclose(f);
+    return 0;
+}
+
+/* ------------------ Raw decode (FULL 1..55) ------------------ */
+static void decode_reg(const uint8_t reg[55], int idx /*1..55*/, uint8_t b){
     switch (idx){
         case 1:
             printf("  TVGAIN0:       0x%02X | TVG_T0=%u TVG_T1=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b));
@@ -46,7 +203,6 @@ static void decode_reg(int idx /*1..55*/, uint8_t b){
             printf("  TVGAIN3:       0x%02X | TVG_G1=%u TVG_G2=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b));
             break;
         case 5:
-            // Printed as provided (note overlap naming in your spec)
             printf("  TVGAIN4:       0x%02X | TVG_G2=%u TVG_G3=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b));
             break;
         case 6:
@@ -108,35 +264,33 @@ static void decode_reg(int idx /*1..55*/, uint8_t b){
         case 17: {
             uint8_t fdiag_err = (uint8_t)GET_BITS(b, 5, 3);
             uint8_t sat_th    = (uint8_t)GET_BITS(b, 1, 4);
-            uint8_t p1_nls_en = (uint8_t)GET_BITS(b, 0, 1);
-            printf("  SAT_FDIAG_TH:  0x%02X | FDIAG_ERR_TH=%u SAT_TH=%u P1_NLS_EN=%u\n",
-                   b, fdiag_err, sat_th, p1_nls_en);
+            uint8_t p1_nls    = (uint8_t)GET_BITS(b, 0, 1);
+            printf("  SAT_FDIAG_TH:  0x%02X | FDIAG_ERR_TH=%u SAT_TH=%u P1_NLS_EN=%u\n", b, fdiag_err, sat_th, p1_nls);
             break;
         }
         case 18: {
-            uint8_t p2_nls_en    = (uint8_t)GET_BITS(b, 7, 1);
-            uint8_t vpwr_ov_th   = (uint8_t)GET_BITS(b, 5, 2);
-            uint8_t lmp_tmr      = (uint8_t)GET_BITS(b, 3, 2);
-            uint8_t fvolt_err_th = (uint8_t)GET_BITS(b, 0, 3);
+            uint8_t p2_nls     = (uint8_t)GET_BITS(b, 7, 1);
+            uint8_t vpwr_ov_th = (uint8_t)GET_BITS(b, 5, 2);
+            uint8_t lmp_tmr    = (uint8_t)GET_BITS(b, 3, 2);
+            uint8_t fvolt_err  = (uint8_t)GET_BITS(b, 0, 3);
             printf("  FVOLT_DEC:     0x%02X | P2_NLS_EN=%u VPWR_OV_TH=%u LMP_TMR=%u FVOLT_ERR_TH=%u\n",
-                   b, p2_nls_en, vpwr_ov_th, lmp_tmr, fvolt_err_th);
+                   b, p2_nls, vpwr_ov_th, lmp_tmr, fvolt_err);
             break;
         }
         case 19: {
-            uint8_t afe_gain_rng     = (uint8_t)GET_BITS(b, 6, 2);
-            uint8_t lpm_en           = (uint8_t)GET_BITS(b, 5, 1);
-            uint8_t decpl_temp_sel   = (uint8_t)GET_BITS(b, 4, 1);
-            uint8_t decpl_t          = (uint8_t)GET_BITS(b, 0, 4);
+            uint8_t afe_gain = (uint8_t)GET_BITS(b, 6, 2);
+            uint8_t lpm_en   = (uint8_t)GET_BITS(b, 5, 1);
+            uint8_t sel      = (uint8_t)GET_BITS(b, 4, 1);
+            uint8_t decpl_t  = (uint8_t)GET_BITS(b, 0, 4);
             printf("  DECPL_TEMP:    0x%02X | AFE_GAIN_RNG=%u LPM_EN=%u DECPL_TEMP_SEL=%u DECPL_T=%u\n",
-                   b, afe_gain_rng, lpm_en, decpl_temp_sel, decpl_t);
+                   b, afe_gain, lpm_en, sel, decpl_t);
             break;
         }
         case 20: {
-            uint8_t noise_lvl = (uint8_t)GET_BITS(b, 3, 5);
-            uint8_t scale_k   = (uint8_t)GET_BITS(b, 2, 1);
-            uint8_t scale_n   = (uint8_t)GET_BITS(b, 0, 2);
-            printf("  DSP_SCALE:     0x%02X | NOISE_LVL=%u SCALE_K=%u SCALE_N=%u\n",
-                   b, noise_lvl, scale_k, scale_n);
+            uint8_t noise = (uint8_t)GET_BITS(b, 3, 5);
+            uint8_t k     = (uint8_t)GET_BITS(b, 2, 1);
+            uint8_t n     = (uint8_t)GET_BITS(b, 0, 2);
+            printf("  DSP_SCALE:     0x%02X | NOISE_LVL=%u SCALE_K=%u SCALE_N=%u\n", b, noise, k, n);
             break;
         }
         case 21:
@@ -157,56 +311,92 @@ static void decode_reg(int idx /*1..55*/, uint8_t b){
             break;
         }
 
-        // Threshold tables: mostly 4b+4b, then 8b entries
-        case 24: printf("  P1_THR_0:      0x%02X | TH_P1_T1=%u TH_P1_T2=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 25: printf("  P1_THR_1:      0x%02X | TH_P1_T3=%u TH_P1_T4=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 26: printf("  P1_THR_2:      0x%02X | TH_P1_T5=%u TH_P1_T6=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 27: printf("  P1_THR_3:      0x%02X | TH_P1_T7=%u TH_P1_T8=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 28: printf("  P1_THR_4:      0x%02X | TH_P1_T9=%u TH_P1_T10=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 29: printf("  P1_THR_5:      0x%02X | TH_P1_T11=%u TH_P1_T12=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 30: printf("  P1_THR_6:      0x%02X | TH_P1_L1=%u TH_P1_L2=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 31: printf("  P1_THR_7:      0x%02X | TH_P1_L3=%u TH_P1_L4=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 32: printf("  P1_THR_8:      0x%02X | TH_P1_L4=%u TH_P1_L5=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 33: printf("  P1_THR_9:      0x%02X | TH_P1_L5=%u TH_P1_L6=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 34: printf("  P1_THR_10:     0x%02X | TH_P1_L7=%u TH_P1_L8=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
+        /* P1 times */
+        case 24: printf("  P1_THR_0:      0x%02X | (TIEMPOS) T1=%dus T2=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+        case 25: printf("  P1_THR_1:      0x%02X | (TIEMPOS) T3=%dus T4=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+        case 26: printf("  P1_THR_2:      0x%02X | (TIEMPOS) T5=%dus T6=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+        case 27: printf("  P1_THR_3:      0x%02X | (TIEMPOS) T7=%dus T8=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+        case 28: printf("  P1_THR_4:      0x%02X | (TIEMPOS) T9=%dus T10=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+        case 29: printf("  P1_THR_5:      0x%02X | (TIEMPOS) T11=%dus T12=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
 
+        /* P1 values packed (L1..L8) */
+        case 30: printf("  P1_THR_6:      0x%02X | (VALORES L1..L8, 5-bit packed)\n", b); break;
+        case 31: printf("  P1_THR_7:      0x%02X | (VALORES L1..L8, 5-bit packed)\n", b); break;
+        case 32: printf("  P1_THR_8:      0x%02X | (VALORES L1..L8, 5-bit packed)\n", b); break;
+        case 33: printf("  P1_THR_9:      0x%02X | (VALORES L1..L8, 5-bit packed)\n", b); break;
+        case 34:
+            printf("  P1_THR_10:     0x%02X | (VALORES L1..L8, 5-bit packed)\n", b);
+            print_L1_L8_decoded(reg, 0);
+            break;
+
+        /* P1 L9..L12 */
         case 35: printf("  P1_THR_11:     0x%02X | TH_P1_L9=%u\n",  b, b); break;
         case 36: printf("  P1_THR_12:     0x%02X | TH_P1_L10=%u\n", b, b); break;
         case 37: printf("  P1_THR_13:     0x%02X | TH_P1_L11=%u\n", b, b); break;
         case 38: printf("  P1_THR_14:     0x%02X | TH_P1_L12=%u\n", b, b); break;
-        case 39:
-            printf("  P1_THR_15:     0x%02X | RESERVED=%u\n", b, b);
-            if (b != 0) printf("    WARNING: RESERVED should typically be 0\n");
+        case 39: printf("  P1_THR_15:     0x%02X | RESERVED/TH_P1_OFF(?)\n", b); break;
+
+        /* P2 times */
+        case 40: printf("  P2_THR_0:      0x%02X | (TIEMPOS) T1=%dus T2=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+        case 41: printf("  P2_THR_1:      0x%02X | (TIEMPOS) T3=%dus T4=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+        case 42: printf("  P2_THR_2:      0x%02X | (TIEMPOS) T5=%dus T6=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+        case 43: printf("  P2_THR_3:      0x%02X | (TIEMPOS) T7=%dus T8=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+        case 44: printf("  P2_THR_4:      0x%02X | (TIEMPOS) T9=%dus T10=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+        case 45: printf("  P2_THR_5:      0x%02X | (TIEMPOS) T11=%dus T12=%dus\n", b, nibble_to_us(HI_NIBBLE(b)), nibble_to_us(LO_NIBBLE(b))); break;
+
+        /* P2 values packed (L1..L8) */
+        case 46: printf("  P2_THR_6:      0x%02X | (VALORES L1..L8, 5-bit packed)\n", b); break;
+        case 47: printf("  P2_THR_7:      0x%02X | (VALORES L1..L8, 5-bit packed)\n", b); break;
+        case 48: printf("  P2_THR_8:      0x%02X | (VALORES L1..L8, 5-bit packed)\n", b); break;
+        case 49: printf("  P2_THR_9:      0x%02X | (VALORES L1..L8, 5-bit packed)\n", b); break;
+        case 50:
+            printf("  P2_THR_10:     0x%02X | (VALORES L1..L8, 5-bit packed)\n", b);
+            print_L1_L8_decoded(reg, 1);
             break;
 
-        case 40: printf("  P2_THR_0:      0x%02X | TH_P2_T1=%u TH_P2_T2=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 41: printf("  P2_THR_1:      0x%02X | TH_P2_T3=%u TH_P2_T4=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 42: printf("  P2_THR_2:      0x%02X | TH_P2_T5=%u TH_P2_T6=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 43: printf("  P2_THR_3:      0x%02X | TH_P2_T7=%u TH_P2_T8=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 44: printf("  P2_THR_4:      0x%02X | TH_P2_T9=%u TH_P2_T10=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 45: printf("  P2_THR_5:      0x%02X | TH_P2_T11=%u TH_P2_T12=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 46: printf("  P2_THR_6:      0x%02X | TH_P2_L1=%u TH_P2_L2=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 47: printf("  P2_THR_7:      0x%02X | TH_P2_L3=%u TH_P2_L4=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 48: printf("  P2_THR_8:      0x%02X | TH_P2_L4=%u TH_P2_L5=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 49: printf("  P2_THR_9:      0x%02X | TH_P2_L5=%u TH_P2_L6=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-        case 50: printf("  P2_THR_10:     0x%02X | TH_P2_L7=%u TH_P2_L8=%u\n", b, HI_NIBBLE(b), LO_NIBBLE(b)); break;
-
+        /* P2 L9..L12 */
         case 51: printf("  P2_THR_11:     0x%02X | TH_P2_L9=%u\n",  b, b); break;
         case 52: printf("  P2_THR_12:     0x%02X | TH_P2_L10=%u\n", b, b); break;
         case 53: printf("  P2_THR_13:     0x%02X | TH_P2_L11=%u\n", b, b); break;
         case 54: printf("  P2_THR_14:     0x%02X | TH_P2_L12=%u\n", b, b); break;
-        case 55:
-            printf("  P2_THR_15:     0x%02X | RESERVED=%u\n", b, b);
-            if (b != 0) printf("    WARNING: RESERVED should typically be 0\n");
-            break;
+        case 55: printf("  P2_THR_15:     0x%02X | RESERVED/TH_P2_OFF(?)\n", b); break;
 
         default:
-            printf("  REG_%02d:        0x%02X\n", idx, b);
+            printf("  REG_%02d:       0x%02X\n", idx, b);
             break;
     }
 }
 
-int main(void){
+/* ------------------ CLI ------------------ */
+static void usage(const char *prog){
+    fprintf(stderr,
+        "Uso:\n"
+        "  %s [--csv [prefix]]\n\n"
+        "Lee una trama HEX por stdin.\n"
+        "  --csv           Genera p1_profile.csv y p2_profile.csv\n"
+        "  --csv prefix    Genera prefix_p1_profile.csv y prefix_p2_profile.csv\n",
+        prog
+    );
+}
+
+int main(int argc, char **argv){
+    int want_csv = 0;
+    const char *csv_prefix = NULL;
+
+    if (argc >= 2){
+        if (strcmp(argv[1], "--csv") == 0){
+            want_csv = 1;
+            if (argc >= 3) csv_prefix = argv[2];
+        } else if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0){
+            usage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "Argumento no reconocido: %s\n\n", argv[1]);
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
     uint8_t buf[512];
     char line[4096];
 
@@ -227,24 +417,52 @@ int main(void){
     }
 
     uint16_t prefix = (uint16_t)((buf[0] << 8) | buf[1]);
+
+    uint8_t reg[55];
+    for (int i = 0; i < 55; i++){
+        reg[i] = buf[2 + i];
+    }
+
     printf("HermesDecoder\n");
     printf("Prefix/mode: 0x%04X (ignorado para el mapeo de registros)\n", prefix);
     printf("Bytes totales: %d\n", n);
-
     if (n != 57){
         printf("AVISO: longitud esperada = 57 bytes (2 + 55). Recibida = %d bytes.\n", n);
         printf("      Se decodificarán los primeros 55 bytes de registros igualmente.\n");
     }
     printf("\n");
 
-    // REG1 starts at buf[2]
     for (int i = 0; i < 55; i++){
-        int idx = i + 1;        // 1..55
-        uint8_t v = buf[2 + i]; // byte value for REG idx
+        int idx = i + 1;
         printf("[%02d]", idx);
-        decode_reg(idx, v);
+        decode_reg(reg, idx, reg[i]);
+    }
+
+    if (want_csv){
+        char p1_path[256];
+        char p2_path[256];
+
+        if (csv_prefix && csv_prefix[0] != '\0'){
+            snprintf(p1_path, sizeof(p1_path), "%s_p1_profile.csv", csv_prefix);
+            snprintf(p2_path, sizeof(p2_path), "%s_p2_profile.csv", csv_prefix);
+        } else {
+            snprintf(p1_path, sizeof(p1_path), "p1_profile.csv");
+            snprintf(p2_path, sizeof(p2_path), "p2_profile.csv");
+        }
+
+        int ok1 = write_profile_csv(p1_path, reg, 0);
+        int ok2 = write_profile_csv(p2_path, reg, 1);
+
+        printf("\nCSV:\n");
+        printf("  %s %s\n", (ok1 == 0) ? "OK " : "ERR", p1_path);
+        printf("  %s %s\n", (ok2 == 0) ? "OK " : "ERR", p2_path);
+
+        printf("\nColumnas CSV:\n");
+        printf("  stage,delta_us,t_us,dist_cm,value_pct,value_raw\n");
+        printf("\nGnuplot (X=dist_cm, Y=value_pct):\n");
+        printf("  gnuplot -persist -e \"set datafile sep ','; set grid; set xlabel 'Distancia (cm)'; set ylabel 'Sensibilidad (%%)'; plot '%s' using 4:5 with linespoints\"\n", p1_path);
+        printf("  gnuplot -persist -e \"set datafile sep ','; set grid; set xlabel 'Distancia (cm)'; set ylabel 'Sensibilidad (%%)'; plot '%s' using 4:5 with linespoints\"\n", p2_path);
     }
 
     return 0;
 }
-
