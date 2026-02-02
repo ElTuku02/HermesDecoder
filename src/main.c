@@ -262,6 +262,109 @@ static int write_tvg_csv(const char *path, const uint8_t reg[55]){
     return 0;
 }
 
+static int write_th_profile_json(const char *path, const uint8_t reg[55], int is_p2){
+    int delta_us[12];
+    int L5[8], L8[4];
+    int raw[12];
+
+    extract_T12_us(reg, is_p2, delta_us);
+    extract_L1_L8_5bit(reg, is_p2, L5);
+    extract_L9_L12_8bit(reg, is_p2, L8);
+
+    for (int i = 0; i < 8; i++) raw[i] = L5[i];
+    for (int i = 0; i < 4; i++) raw[8+i] = L8[i];
+
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"profile\": \"%s\",\n", is_p2 ? "P2" : "P1");
+    fprintf(f, "  \"units\": {\"x\": \"cm\", \"time\": \"us\", \"y\": \"percent\"},\n");
+    fprintf(f, "  \"points\": [\n");
+
+    int acc = 0;
+    for (int i = 0; i < 12; i++){
+        int stage = i + 1;
+        acc += delta_us[i];
+        double dist_cm = tof_us_to_cm(acc);
+        double pct = value_to_pct(stage, raw[i]);
+
+        fprintf(f,
+            "    {\"stage\": %d, \"delta_us\": %d, \"t_us\": %d, \"dist_cm\": %.4f, \"value_pct\": %.2f, \"value_raw\": %d}%s\n",
+            stage, delta_us[i], acc, dist_cm, pct, raw[i],
+            (i == 11) ? "" : ","
+        );
+    }
+
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+
+    fclose(f);
+    return 0;
+}
+
+static int write_tvg_json(const char *path, const uint8_t reg[55]){
+    int t_us[6];
+    int g_raw[5];
+    int g_max[5];
+
+    // tiempos (T0..T5)
+    uint8_t b0 = reg[0], b1 = reg[1], b2 = reg[2];
+    t_us[0] = nibble_to_us(HI_NIBBLE(b0));
+    t_us[1] = nibble_to_us(LO_NIBBLE(b0));
+    t_us[2] = nibble_to_us(HI_NIBBLE(b1));
+    t_us[3] = nibble_to_us(LO_NIBBLE(b1));
+    t_us[4] = nibble_to_us(HI_NIBBLE(b2));
+    t_us[5] = nibble_to_us(LO_NIBBLE(b2));
+
+    // ganancias según Excel (G2/G3 partidos)
+    uint8_t tvg3 = reg[3], tvg4 = reg[4], tvg5 = reg[5], tvg6 = reg[6];
+
+    int g2_hi2 = (int)GET_BITS(tvg3, 0, 2);   // TVGAIN3 b1..b0
+    int g2_lo4 = (int)GET_BITS(tvg4, 4, 4);   // TVGAIN4 b7..b4
+    int g3_hi4 = (int)GET_BITS(tvg4, 0, 4);   // TVGAIN4 b3..b0
+    int g3_lo2 = (int)GET_BITS(tvg5, 6, 2);   // TVGAIN5 b7..b6
+
+    g_raw[0] = (int)GET_BITS(tvg3, 2, 6);         g_max[0] = 63; // G1
+    g_raw[1] = (g2_hi2 << 4) | g2_lo4;            g_max[1] = 63; // G2
+    g_raw[2] = (g3_hi4 << 2) | g3_lo2;            g_max[2] = 63; // G3
+    g_raw[3] = (int)GET_BITS(tvg5, 0, 6);         g_max[3] = 63; // G4
+    g_raw[4] = (int)GET_BITS(tvg6, 2, 6);         g_max[4] = 63; // G5
+
+    int reserved  = (int)GET_BITS(tvg6, 1, 1);
+    int freq_shift = (int)GET_BITS(tvg6, 0, 1);
+
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+
+    fprintf(f, "{\n");
+    fprintf(f, "  \"profile\": \"TVG\",\n");
+    fprintf(f, "  \"units\": {\"x\": \"cm\", \"time\": \"us\", \"y\": \"percent\"},\n");
+    fprintf(f, "  \"flags\": {\"reserved\": %d, \"freq_shift\": %d},\n", reserved, freq_shift);
+    fprintf(f, "  \"points\": [\n");
+
+    int acc_us = 0;
+    for (int i = 0; i < 6; i++){
+        acc_us += t_us[i];
+
+        int gain_idx = (i < 5) ? i : 4; // cola mantiene G5
+        double gain_pct = (g_raw[gain_idx] / (double)g_max[gain_idx]) * 100.0;
+        double dist_cm = tof_us_to_cm(acc_us);
+
+        fprintf(f,
+            "    {\"stage\": %d, \"delta_us\": %d, \"t_us\": %d, \"dist_cm\": %.4f, \"gain_pct\": %.2f, \"gain_raw\": %d, \"gain_raw_max\": %d}%s\n",
+            i + 1, t_us[i], acc_us, dist_cm, gain_pct, g_raw[gain_idx], g_max[gain_idx],
+            (i == 5) ? "" : ","
+        );
+    }
+
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+
+    fclose(f);
+    return 0;
+}
+
 /* ------------------ Gnuplot plotting ------------------ */
 static void plot_profiles(const char *p1_csv, const char *p2_csv){
     FILE *gp = popen("gnuplot -persist", "w");
@@ -508,53 +611,90 @@ static void decode_reg(const uint8_t reg[55], int idx /*1..55*/, uint8_t b){
 static void usage(const char *prog){
     fprintf(stderr,
         "Uso:\n"
-        "  %s [--csv [prefix]]\n"
-        "  %s --plot [prefix]\n\n"
-        "Lee una trama HEX por stdin.\n"
-        "  --csv            Genera CSV (sin gráfica)\n"
-        "  --plot           Genera CSV TH y muestra gráfica (P1 vs P2)\n"
-        "  --plot-tvg       Genera CSV TVG y muestra gráfica (ganancia vs distancia)\n"
-        "  Puedes combinar flags: --plot --plot-tvg\n"
-        "  --help, -h      Muestra esta ayuda\n",
-        prog, prog
+        "  %s [opciones]\n\n"
+
+        "Descripción:\n"
+        "  Lee una trama HEX por stdin y decodifica la configuración del PGA460.\n"
+        "  Puede mostrar gráficas interactivas y/o exportar perfiles a disco.\n\n"
+
+        "Opciones:\n"
+        "  --plot [prefix]        Muestra gráfica TH (P1 vs P2).\n"
+        "                         No exporta CSV ni JSON.\n\n"
+
+        "  --plot-tvg [prefix]    Muestra gráfica TVG (ganancia vs distancia).\n"
+        "                         No exporta CSV ni JSON.\n\n"
+
+        "  --export-csv [prefix]  Exporta perfiles TH (P1/P2) y TVG en CSV.\n"
+        "                         No muestra gráficas.\n\n"
+
+        "  --export-json [prefix] Exporta perfiles TH (P1/P2) y TVG en JSON.\n"
+        "                         No muestra gráficas.\n\n"
+
+        "  --help, -h             Muestra esta ayuda.\n\n"
+
+        "Notas:\n"
+        "  - Las opciones --plot y --plot-tvg pueden combinarse.\n"
+        "  - Las opciones --export-csv y --export-json pueden combinarse\n"
+        "    entre sí y con --plot / --plot-tvg.\n"
+        "  - El prefijo es opcional y se usa para nombrar los ficheros exportados.\n\n"
+
+        "Ejemplos:\n"
+        "  %s --plot\n"
+        "  %s --plot-tvg\n"
+        "  %s --plot --plot-tvg\n"
+        "  %s --export-csv test\n"
+        "  %s --export-json test\n"
+        "  %s --plot --export-csv test\n"
+        "  %s --plot --plot-tvg --export-json test\n",
+        prog, prog, prog, prog, prog, prog, prog, prog
     );
 }
 
 
+
 int main(int argc, char **argv){
-    int want_csv = 0;
-    int want_plot = 0;
+    int want_plot_th = 0;
     int want_plot_tvg = 0;
+    int want_export_csv = 0;
+    int want_export_json = 0;
     const char *csv_prefix = NULL;
 
     for (int i = 1; i < argc; i++){
-        if (strcmp(argv[i], "--csv") == 0){
-            want_csv = 1;
-            // prefijo opcional si el siguiente no empieza por --
+        if (strcmp(argv[i], "--export-csv") == 0){
+            want_export_csv = 1;
             if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0){
                 csv_prefix = argv[++i];
             }
+
+        } else if (strcmp(argv[i], "--export-json") == 0){
+            want_export_json = 1;
+            if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0){
+                csv_prefix = argv[++i];
+            }
+
         } else if (strcmp(argv[i], "--plot") == 0){
-            want_csv = 1;
-            want_plot = 1;
+            want_plot_th = 1;
             if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0){
                 csv_prefix = argv[++i];
             }
+
         } else if (strcmp(argv[i], "--plot-tvg") == 0){
-            want_csv = 1;
             want_plot_tvg = 1;
             if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0){
                 csv_prefix = argv[++i];
             }
+
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0){
             usage(argv[0]);
             return 0;
+
         } else {
             fprintf(stderr, "Argumento no reconocido: %s\n\n", argv[i]);
             usage(argv[0]);
             return 1;
         }
     }
+
 
 
     uint8_t buf[512];
@@ -598,72 +738,101 @@ int main(int argc, char **argv){
         decode_reg(reg, idx, reg[i]);
     }
 
-    if (want_csv){
-        char p1_path[256], p2_path[256], tvg_csv[256];
-        
+     // --- Export/plot section ---
+    if (want_export_csv || want_plot_th || want_plot_tvg){
+
+        // Rutas CSV "export" (solo si want_export_csv)
+        char p1_export[256], p2_export[256], tvg_export[256];
+        char p1_json[256], p2_json[256], tvg_json[256];
+
         if (csv_prefix && csv_prefix[0]){
-            snprintf(p1_path, sizeof(p1_path), "%s_p1_profile.csv", csv_prefix);
-            snprintf(p2_path, sizeof(p2_path), "%s_p2_profile.csv", csv_prefix);
-            snprintf(tvg_csv, sizeof(tvg_csv), "%s_tvg_profile.csv", csv_prefix);
+            snprintf(p1_export, sizeof(p1_export), "%s_p1_profile.csv", csv_prefix);
+            snprintf(p2_export, sizeof(p2_export), "%s_p2_profile.csv", csv_prefix);
+            snprintf(tvg_export, sizeof(tvg_export), "%s_tvg_profile.csv", csv_prefix);
         } else {
-            snprintf(p1_path, sizeof(p1_path), "p1_profile.csv");
-            snprintf(p2_path, sizeof(p2_path), "p2_profile.csv");
-            snprintf(tvg_csv, sizeof(tvg_csv), "tvg_profile.csv");
+            snprintf(p1_export, sizeof(p1_export), "p1_profile.csv");
+            snprintf(p2_export, sizeof(p2_export), "p2_profile.csv");
+            snprintf(tvg_export, sizeof(tvg_export), "tvg_profile.csv");
         }
 
-        int ok_p1 = 0, ok_p2 = 0, ok_tvg = 0;
-
-        // Si quieres TH (por --plot) o si --csv sin más y tú quieres seguir generando TH siempre,
-        // entonces genera TH cuando corresponda:
-        if (want_plot || (want_csv && !want_plot_tvg)) {
-            ok_p1 = write_th_profile_csv(p1_path, reg, 0);
-            ok_p2 = write_th_profile_csv(p2_path, reg, 1);
+        if (csv_prefix && csv_prefix[0]){
+            snprintf(p1_json, sizeof(p1_json), "%s_p1_profile.json", csv_prefix);
+            snprintf(p2_json, sizeof(p2_json), "%s_p2_profile.json", csv_prefix);
+            snprintf(tvg_json, sizeof(tvg_json), "%s_tvg_profile.json", csv_prefix);
+        } else {
+            snprintf(p1_json, sizeof(p1_json), "p1_profile.json");
+            snprintf(p2_json, sizeof(p2_json), "p2_profile.json");
+            snprintf(tvg_json, sizeof(tvg_json), "tvg_profile.json");
         }
 
-        // Si quieres TVG (por --plot-tvg) o si quieres que --csv también lo incluya:
-        if (want_plot_tvg || want_csv) {
-            ok_tvg = write_tvg_csv(tvg_csv, reg);
+        // Rutas CSV temporales para plot (no exporta)
+        const char *p1_tmp  = "/tmp/hermes_p1_profile.csv";
+        const char *p2_tmp  = "/tmp/hermes_p2_profile.csv";
+        const char *tvg_tmp = "/tmp/hermes_tvg_profile.csv";
+
+        int ok_p1_plot = 0, ok_p2_plot = 0, ok_tvg_plot = 0;
+        int ok_p1_exp  = 0, ok_p2_exp  = 0, ok_tvg_exp  = 0;
+
+        // --- Generar CSVs para PLOT (temporales) ---
+        if (want_plot_th){
+            ok_p1_plot = write_th_profile_csv(p1_tmp, reg, 0);
+            ok_p2_plot = write_th_profile_csv(p2_tmp, reg, 1);
+        }
+        if (want_plot_tvg){
+            ok_tvg_plot = write_tvg_csv(tvg_tmp, reg);
         }
 
-        if (want_plot){
-            if (ok_p1==0 && ok_p2==0){
+        // --- Plot (usa SIEMPRE los temporales) ---
+        if (want_plot_th){
+            if (ok_p1_plot==0 && ok_p2_plot==0){
                 printf("\nMostrando gráfica TH (P1 vs P2)...\n");
-                plot_profiles(p1_path, p2_path); // tu función de TH
+                plot_profiles(p1_tmp, p2_tmp);
             } else {
-                printf("\nNo se puede plotear TH: CSVs incorrectos.\n");
+                printf("\nNo se puede plotear TH: error generando CSV temporal.\n");
             }
         }
 
         if (want_plot_tvg){
-            if (ok_tvg==0){
+            if (ok_tvg_plot==0){
                 printf("\nMostrando gráfica TVG...\n");
-                plot_tvg(tvg_csv); // tu función de TVG
+                plot_tvg(tvg_tmp);
             } else {
-                printf("\nNo se puede plotear TVG: CSV incorrecto.\n");
+                printf("\nNo se puede plotear TVG: error generando CSV temporal.\n");
             }
         }
-        
-        if (want_plot){
-            printf("\nMostrando gráfica con gnuplot...\n");
-            printf("\nColumnas CSV:\n");
-            printf("  stage,delta_us,t_us,dist_cm,value_pct,value_raw\n");
-        }
-        if (want_plot_tvg && ok_tvg == 0){
-            printf("\nMostrando gráfica TVG con gnuplot...\n");
-            printf("\nColumnas CSV:\n");
-            printf("stage,delta_us,t_us,dist_cm_tvg,gain_pct,gain_raw,gain_raw_max\n");
 
+        // Borrar temporales al finalizar
+        if (want_plot_th){
+            remove(p1_tmp);
+            remove(p2_tmp);
+        }
+        if (want_plot_tvg){
+            remove(tvg_tmp);
         }
 
-        printf("\nCSV:\n");
-        if (want_plot || (want_csv && !want_plot_tvg)){
-            printf("  %s %s\n", (ok_p1==0) ? "OK " : "ERR", p1_path);
-            printf("  %s %s\n", (ok_p2==0) ? "OK " : "ERR", p2_path);
+        // --- Generar CSVs para EXPORT (persistentes) ---
+        if (want_export_csv){
+            // Política: exportar siempre todo (TH + TVG)
+            ok_p1_exp = write_th_profile_csv(p1_export, reg, 0);
+            ok_p2_exp = write_th_profile_csv(p2_export, reg, 1);
+            ok_tvg_exp = write_tvg_csv(tvg_export, reg);
+
+            printf("\nCSV exportados:\n");
+            printf("  %s %s\n", (ok_p1_exp==0) ? "OK " : "ERR", p1_export);
+            printf("  %s %s\n", (ok_p2_exp==0) ? "OK " : "ERR", p2_export);
+            printf("  %s %s\n", (ok_tvg_exp==0) ? "OK " : "ERR", tvg_export);
         }
-        if (want_plot_tvg || want_csv){
-            printf("  %s %s\n", (ok_tvg==0) ? "OK " : "ERR", tvg_csv);
+
+        if (want_export_json){
+            int ok_j1 = write_th_profile_json(p1_json, reg, 0);
+            int ok_j2 = write_th_profile_json(p2_json, reg, 1);
+            int ok_j3 = write_tvg_json(tvg_json, reg);
+
+            printf("\nJSON exportados:\n");
+            printf("  %s %s\n", (ok_j1==0) ? "OK " : "ERR", p1_json);
+            printf("  %s %s\n", (ok_j2==0) ? "OK " : "ERR", p2_json);
+            printf("  %s %s\n", (ok_j3==0) ? "OK " : "ERR", tvg_json);
         }
     }
-
     return 0;
 }
