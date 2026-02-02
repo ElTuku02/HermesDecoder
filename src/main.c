@@ -149,7 +149,7 @@ static void print_L1_L8_decoded(const uint8_t reg[55], int is_p2){
     }
 }
 
-static int write_profile_csv(const char *path, const uint8_t reg[55], int is_p2){
+static int write_th_profile_csv(const char *path, const uint8_t reg[55], int is_p2){
     int delta_us[12];
     int L5[8], L8[4];
     int value_raw[12];
@@ -186,6 +186,143 @@ static int write_profile_csv(const char *path, const uint8_t reg[55], int is_p2)
     fclose(f);
     return 0;
 }
+
+static int write_tvg_csv(const char *path, const uint8_t reg[55]){
+    int t_us[6];
+    int g_raw[5];
+    int g_max[5];
+
+    /* Extraer tiempos TVG (T0..T5) */
+    uint8_t b0 = reg[0]; // TVGAIN0
+    uint8_t b1 = reg[1]; // TVGAIN1
+    uint8_t b2 = reg[2]; // TVGAIN2
+
+    t_us[0] = nibble_to_us(HI_NIBBLE(b0));
+    t_us[1] = nibble_to_us(LO_NIBBLE(b0));
+    t_us[2] = nibble_to_us(HI_NIBBLE(b1));
+    t_us[3] = nibble_to_us(LO_NIBBLE(b1));
+    t_us[4] = nibble_to_us(HI_NIBBLE(b2));
+    t_us[5] = nibble_to_us(LO_NIBBLE(b2));
+
+    /* Extraer ganancias TVG (G1..G5) - SEGÚN EXCEL (G2 y G3 PARTIDOS) */
+    uint8_t tvg3 = reg[3]; // TVGAIN3
+    uint8_t tvg4 = reg[4]; // TVGAIN4
+    uint8_t tvg5 = reg[5]; // TVGAIN5
+    uint8_t tvg6 = reg[6]; // TVGAIN6
+
+    // Partes de G2 y G3 (ver Excel)
+    int g2_hi2 = (int)GET_BITS(tvg3, 0, 2); // TVGAIN3 b1..b0 -> G2[5:4]
+    int g2_lo4 = (int)GET_BITS(tvg4, 4, 4); // TVGAIN4 b7..b4 -> G2[3:0]
+
+    int g3_hi4 = (int)GET_BITS(tvg4, 0, 4); // TVGAIN4 b3..b0 -> G3[5:2]
+    int g3_lo2 = (int)GET_BITS(tvg5, 6, 2); // TVGAIN5 b7..b6 -> G3[1:0]
+
+    // Ganancias finales (todas 6 bits)
+    g_raw[0] = (int)GET_BITS(tvg3, 2, 6);        g_max[0] = 63; // G1 = TVGAIN3 b7..b2
+    g_raw[1] = (g2_hi2 << 4) | g2_lo4;           g_max[1] = 63; // G2 (6b) = (hi2<<4) | lo4
+    g_raw[2] = (g3_hi4 << 2) | g3_lo2;           g_max[2] = 63; // G3 (6b) = (hi4<<2) | lo2
+    g_raw[3] = (int)GET_BITS(tvg5, 0, 6);        g_max[3] = 63; // G4 = TVGAIN5 b5..b0
+    g_raw[4] = (int)GET_BITS(tvg6, 2, 6);        g_max[4] = 63; // G5 = TVGAIN6 b7..b2
+
+    // Flags TVGAIN6
+    int reserved   = (int)GET_BITS(tvg6, 1, 1);
+    int freq_shift = (int)GET_BITS(tvg6, 0, 1);
+    if (reserved != 0){
+        printf("WARNING: TVGAIN6 RESERVED bit != 0 (%d)\n", reserved);
+    }
+    (void)freq_shift; // por ahora no se usa
+
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+
+    fprintf(f, "stage,delta_us,t_us,dist_cm_tvg,gain_pct,gain_raw,gain_raw_max\n");
+
+    int acc_us = 0;
+    for (int i = 0; i < 6; i++){
+        acc_us += t_us[i];
+
+        int gain_idx = (i < 5) ? i : 4; // último tramo mantiene G5
+        double gain_pct = (g_raw[gain_idx] / (double)g_max[gain_idx]) * 100.0;
+        double dist_cm_tvg = tof_us_to_cm(acc_us);
+
+        fprintf(
+            f,
+            "%d,%d,%d,%.4f,%.2f,%d,%d\n",
+            i + 1,
+            t_us[i],
+            acc_us,
+            dist_cm_tvg,
+            gain_pct,
+            g_raw[gain_idx],
+            g_max[gain_idx]
+        );
+    }
+
+    fclose(f);
+    return 0;
+}
+
+/* ------------------ Gnuplot plotting ------------------ */
+static void plot_profiles(const char *p1_csv, const char *p2_csv){
+    FILE *gp = popen("gnuplot -persist", "w");
+    if (!gp){
+        printf("ERROR: no se pudo lanzar gnuplot (¿instalado?).\n");
+        return;
+    }
+
+    fprintf(gp, "set datafile separator ','\n");
+    fprintf(gp, "set grid\n");
+    fprintf(gp, "set xlabel 'Distancia (cm)'\n");
+    fprintf(gp, "set ylabel 'Sensibilidad (%%)'\n");
+    fprintf(gp, "set title 'Perfil de sensibilidad P1 vs P2'\n");
+    fprintf(gp, "set key outside top right vertical\n");
+
+    fprintf(gp, "set style line 1 lc rgb '#1f77b4' lw 2 pt 7\n");
+    fprintf(gp, "set style line 2 lc rgb '#d62728' lw 2 pt 5\n");
+
+    fprintf(
+        gp,
+        "plot '%s' using 4:5 with linespoints ls 1 title 'P1', "
+        "'%s' using 4:5 with linespoints ls 2 title 'P2'\n",
+        p1_csv,
+        p2_csv
+    );
+
+    fflush(gp);
+    pclose(gp);
+}
+
+static void plot_tvg(const char *tvg_csv){
+    FILE *gp = popen("gnuplot -persist", "w");
+    if (!gp){
+        printf("ERROR: no se pudo lanzar gnuplot (¿instalado?).\n");
+        return;
+    }
+
+    fprintf(gp, "set datafile separator ','\n");
+    fprintf(gp, "set grid\n");
+    fprintf(gp, "set title 'TVG: Ganancia vs Distancia'\n");
+    fprintf(gp, "set xlabel 'Distancia (cm)'\n");
+    fprintf(gp, "set ylabel 'Ganancia (%%)'\n");
+    fprintf(gp, "set yrange [0:100]\n");
+    fprintf(gp, "set xrange [0:*]\n");
+    fprintf(gp, "set key outside top right vertical\n");
+    fprintf(gp,
+        "plot "
+        "'%s' using (0):(column(5)) every ::0::0 with steps lw 2 notitle, "
+        "'%s' using 4:5 with steps lw 2 title 'TVG', "
+        "'%s' using 4:5 with points pt 7 ps 1.2 lc rgb 'black' title 'Puntos TVG'\n",
+        tvg_csv,
+        tvg_csv,
+        tvg_csv
+    );
+
+    fflush(gp);
+    pclose(gp);
+}
+
+
+
 
 /* ------------------ Raw decode (FULL 1..55) ------------------ */
 static void decode_reg(const uint8_t reg[55], int idx /*1..55*/, uint8_t b){
@@ -371,31 +508,54 @@ static void decode_reg(const uint8_t reg[55], int idx /*1..55*/, uint8_t b){
 static void usage(const char *prog){
     fprintf(stderr,
         "Uso:\n"
-        "  %s [--csv [prefix]]\n\n"
+        "  %s [--csv [prefix]]\n"
+        "  %s --plot [prefix]\n\n"
         "Lee una trama HEX por stdin.\n"
-        "  --csv           Genera p1_profile.csv y p2_profile.csv\n"
-        "  --csv prefix    Genera prefix_p1_profile.csv y prefix_p2_profile.csv\n",
-        prog
+        "  --csv            Genera CSV (sin gráfica)\n"
+        "  --plot           Genera CSV TH y muestra gráfica (P1 vs P2)\n"
+        "  --plot-tvg       Genera CSV TVG y muestra gráfica (ganancia vs distancia)\n"
+        "  Puedes combinar flags: --plot --plot-tvg\n"
+        "  --help, -h      Muestra esta ayuda\n",
+        prog, prog
     );
 }
 
+
 int main(int argc, char **argv){
     int want_csv = 0;
+    int want_plot = 0;
+    int want_plot_tvg = 0;
     const char *csv_prefix = NULL;
 
-    if (argc >= 2){
-        if (strcmp(argv[1], "--csv") == 0){
+    for (int i = 1; i < argc; i++){
+        if (strcmp(argv[i], "--csv") == 0){
             want_csv = 1;
-            if (argc >= 3) csv_prefix = argv[2];
-        } else if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0){
+            // prefijo opcional si el siguiente no empieza por --
+            if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0){
+                csv_prefix = argv[++i];
+            }
+        } else if (strcmp(argv[i], "--plot") == 0){
+            want_csv = 1;
+            want_plot = 1;
+            if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0){
+                csv_prefix = argv[++i];
+            }
+        } else if (strcmp(argv[i], "--plot-tvg") == 0){
+            want_csv = 1;
+            want_plot_tvg = 1;
+            if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0){
+                csv_prefix = argv[++i];
+            }
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0){
             usage(argv[0]);
             return 0;
         } else {
-            fprintf(stderr, "Argumento no reconocido: %s\n\n", argv[1]);
+            fprintf(stderr, "Argumento no reconocido: %s\n\n", argv[i]);
             usage(argv[0]);
             return 1;
         }
     }
+
 
     uint8_t buf[512];
     char line[4096];
@@ -439,29 +599,70 @@ int main(int argc, char **argv){
     }
 
     if (want_csv){
-        char p1_path[256];
-        char p2_path[256];
-
-        if (csv_prefix && csv_prefix[0] != '\0'){
+        char p1_path[256], p2_path[256], tvg_csv[256];
+        
+        if (csv_prefix && csv_prefix[0]){
             snprintf(p1_path, sizeof(p1_path), "%s_p1_profile.csv", csv_prefix);
             snprintf(p2_path, sizeof(p2_path), "%s_p2_profile.csv", csv_prefix);
+            snprintf(tvg_csv, sizeof(tvg_csv), "%s_tvg_profile.csv", csv_prefix);
         } else {
             snprintf(p1_path, sizeof(p1_path), "p1_profile.csv");
             snprintf(p2_path, sizeof(p2_path), "p2_profile.csv");
+            snprintf(tvg_csv, sizeof(tvg_csv), "tvg_profile.csv");
         }
 
-        int ok1 = write_profile_csv(p1_path, reg, 0);
-        int ok2 = write_profile_csv(p2_path, reg, 1);
+        int ok_p1 = 0, ok_p2 = 0, ok_tvg = 0;
+
+        // Si quieres TH (por --plot) o si --csv sin más y tú quieres seguir generando TH siempre,
+        // entonces genera TH cuando corresponda:
+        if (want_plot || (want_csv && !want_plot_tvg)) {
+            ok_p1 = write_th_profile_csv(p1_path, reg, 0);
+            ok_p2 = write_th_profile_csv(p2_path, reg, 1);
+        }
+
+        // Si quieres TVG (por --plot-tvg) o si quieres que --csv también lo incluya:
+        if (want_plot_tvg || want_csv) {
+            ok_tvg = write_tvg_csv(tvg_csv, reg);
+        }
+
+        if (want_plot){
+            if (ok_p1==0 && ok_p2==0){
+                printf("\nMostrando gráfica TH (P1 vs P2)...\n");
+                plot_profiles(p1_path, p2_path); // tu función de TH
+            } else {
+                printf("\nNo se puede plotear TH: CSVs incorrectos.\n");
+            }
+        }
+
+        if (want_plot_tvg){
+            if (ok_tvg==0){
+                printf("\nMostrando gráfica TVG...\n");
+                plot_tvg(tvg_csv); // tu función de TVG
+            } else {
+                printf("\nNo se puede plotear TVG: CSV incorrecto.\n");
+            }
+        }
+        
+        if (want_plot){
+            printf("\nMostrando gráfica con gnuplot...\n");
+            printf("\nColumnas CSV:\n");
+            printf("  stage,delta_us,t_us,dist_cm,value_pct,value_raw\n");
+        }
+        if (want_plot_tvg && ok_tvg == 0){
+            printf("\nMostrando gráfica TVG con gnuplot...\n");
+            printf("\nColumnas CSV:\n");
+            printf("stage,delta_us,t_us,dist_cm_tvg,gain_pct,gain_raw,gain_raw_max\n");
+
+        }
 
         printf("\nCSV:\n");
-        printf("  %s %s\n", (ok1 == 0) ? "OK " : "ERR", p1_path);
-        printf("  %s %s\n", (ok2 == 0) ? "OK " : "ERR", p2_path);
-
-        printf("\nColumnas CSV:\n");
-        printf("  stage,delta_us,t_us,dist_cm,value_pct,value_raw\n");
-        printf("\nGnuplot (X=dist_cm, Y=value_pct):\n");
-        printf("  gnuplot -persist -e \"set datafile sep ','; set grid; set xlabel 'Distancia (cm)'; set ylabel 'Sensibilidad (%%)'; plot '%s' using 4:5 with linespoints\"\n", p1_path);
-        printf("  gnuplot -persist -e \"set datafile sep ','; set grid; set xlabel 'Distancia (cm)'; set ylabel 'Sensibilidad (%%)'; plot '%s' using 4:5 with linespoints\"\n", p2_path);
+        if (want_plot || (want_csv && !want_plot_tvg)){
+            printf("  %s %s\n", (ok_p1==0) ? "OK " : "ERR", p1_path);
+            printf("  %s %s\n", (ok_p2==0) ? "OK " : "ERR", p2_path);
+        }
+        if (want_plot_tvg || want_csv){
+            printf("  %s %s\n", (ok_tvg==0) ? "OK " : "ERR", tvg_csv);
+        }
     }
 
     return 0;
